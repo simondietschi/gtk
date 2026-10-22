@@ -741,7 +741,9 @@ gtk_text_content_get_value (GdkContentProvider  *provider,
 
       if (gtk_text_get_selection_bounds (content->self, &start, &end))
         {
-          char *str = gtk_text_get_display_text (content->self, start, end);
+          char *str = gtk_text_get_display_text (content->self,
+                                                 MIN (start, end),
+                                                 MAX (start, end));
           g_value_take_string (value, str);
         }
       return TRUE;
