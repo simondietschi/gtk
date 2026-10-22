@@ -18,6 +18,8 @@ endif
 #  - 'c_args': (array): additional compiler arguments
 #  - 'link_args': (array): additional linker arguments
 #  - 'suites': (array): additional test suites
+#  - 'parallel': (bool): whether the test can run in parallel with others
+#                (internal tests only, defaults to true)
 tests = [
   { 'name': 'accel' },
   # we are still missing some accessors
@@ -130,6 +132,10 @@ internal_tests = [
   { 'name': 'timsort' },
   { 'name': 'textbuffer' },
   { 'name': 'texthistory' },
+  {
+    'name': 'primary-selection',
+    'parallel': false,
+  },
   { 'name': 'fnmatch' },
   { 'name': 'a11y' },
   { 'name': 'listitemmanager' },
@@ -204,6 +210,7 @@ foreach t : internal_tests
   test_extra_ldflags = t.get('link_args', [])
   test_extra_libs = t.get('libs', [])
   test_extra_suites = t.get('suites', [])
+  test_parallel = t.get('parallel', true)
   test_timeout = 60
 
   test_exe = executable(test_name,
@@ -224,6 +231,7 @@ foreach t : internal_tests
     timeout: test_timeout,
     env: test_env,
     suite: ['gtk'] + test_extra_suites,
+    is_parallel: test_parallel,
   )
 endforeach
 
