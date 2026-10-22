@@ -54,6 +54,7 @@
 #include "gtkmarshalers.h"
 #include "gtknative.h"
 #include "gtkpangoprivate.h"
+#include "gtkpasswordentrybuffer.h"
 #include "gtkpopovermenu.h"
 #include "gtkprivate.h"
 #include "gtkrenderbackgroundprivate.h"
@@ -316,6 +317,7 @@ struct _GtkTextPrivate
   guint         propagate_text_width    : 1;
   guint         text_handles_enabled    : 1;
   guint         enable_undo             : 1;
+  guint         ever_invisible          : 1; /* Treat as a password, even when revealed */
 };
 
 struct _GtkTextPasswordHint
@@ -614,6 +616,7 @@ static void         gtk_text_select_line              (GtkText        *self);
 static void         gtk_text_paste                    (GtkText        *self,
                                                        GdkClipboard   *clipboard);
 static void         gtk_text_update_primary_selection (GtkText        *self);
+static gboolean     gtk_text_keep_primary_selection   (GtkText        *self);
 static void         gtk_text_schedule_im_reset        (GtkText        *self);
 static gboolean     gtk_text_mnemonic_activate        (GtkWidget      *widget,
                                                        gboolean        group_cycling);
@@ -710,7 +713,11 @@ struct _GtkTextContent
 {
   GdkContentProvider parent;
 
+  /* The widget whose selection is served, or NULL once the
+   * provider has been turned into a snapshot of @text
+   */
   GtkText *self;
+  char *text;
 };
 
 struct _GtkTextContentClass
@@ -725,7 +732,12 @@ G_DEFINE_TYPE (GtkTextContent, gtk_text_content, GDK_TYPE_CONTENT_PROVIDER)
 static GdkContentFormats *
 gtk_text_content_ref_formats (GdkContentProvider *provider)
 {
-  return gdk_content_formats_new_for_gtype (G_TYPE_STRING);
+  GtkTextContent *content = GTK_TEXT_CONTENT (provider);
+
+  if (content->self || content->text)
+    return gdk_content_formats_new_for_gtype (G_TYPE_STRING);
+  else
+    return gdk_content_formats_new (NULL, 0);
 }
 
 static gboolean
@@ -735,7 +747,12 @@ gtk_text_content_get_value (GdkContentProvider  *provider,
 {
   GtkTextContent *content = GTK_TEXT_CONTENT (provider);
 
-  if (G_VALUE_HOLDS (value, G_TYPE_STRING))
+  if (G_VALUE_HOLDS (value, G_TYPE_STRING) && content->text)
+    {
+      g_value_set_string (value, content->text);
+      return TRUE;
+    }
+  else if (G_VALUE_HOLDS (value, G_TYPE_STRING) && content->self)
     {
       int start, end;
 
@@ -759,14 +776,30 @@ gtk_text_content_detach (GdkContentProvider *provider,
   GtkTextContent *content = GTK_TEXT_CONTENT (provider);
   int selection_bound, current_pos;
 
+  if (content->self == NULL)
+    return;
+
   gtk_text_get_selection_bounds (content->self, &selection_bound, &current_pos);
   gtk_text_set_selection_bounds (content->self, current_pos, current_pos);
 }
 
 static void
+gtk_text_content_finalize (GObject *object)
+{
+  GtkTextContent *content = GTK_TEXT_CONTENT (object);
+
+  g_free (content->text);
+
+  G_OBJECT_CLASS (gtk_text_content_parent_class)->finalize (object);
+}
+
+static void
 gtk_text_content_class_init (GtkTextContentClass *class)
 {
+  GObjectClass *object_class = G_OBJECT_CLASS (class);
   GdkContentProviderClass *provider_class = GDK_CONTENT_PROVIDER_CLASS (class);
+
+  object_class->finalize = gtk_text_content_finalize;
 
   provider_class->ref_formats = gtk_text_content_ref_formats;
   provider_class->get_value = gtk_text_content_get_value;
@@ -776,6 +809,17 @@ gtk_text_content_class_init (GtkTextContentClass *class)
 static void
 gtk_text_content_init (GtkTextContent *content)
 {
+}
+
+static GdkContentProvider *
+gtk_text_content_new (GtkText *self)
+{
+  GtkTextContent *content;
+
+  content = g_object_new (GTK_TYPE_TEXT_CONTENT, NULL);
+  content->self = self;
+
+  return GDK_CONTENT_PROVIDER (content);
 }
 
 /* GtkText
@@ -2039,8 +2083,7 @@ gtk_text_init (GtkText *self)
 
   gtk_text_history_set_max_undo_levels (priv->history, DEFAULT_MAX_UNDO);
 
-  priv->selection_content = g_object_new (GTK_TYPE_TEXT_CONTENT, NULL);
-  GTK_TEXT_CONTENT (priv->selection_content)->self = self;
+  priv->selection_content = gtk_text_content_new (self);
 
   target = gtk_drop_target_new (G_TYPE_STRING, GDK_ACTION_COPY | GDK_ACTION_MOVE);
   gtk_event_controller_set_static_name (GTK_EVENT_CONTROLLER (target), "gtk-text-drop-target");
@@ -2140,6 +2183,8 @@ gtk_text_dispose (GObject *object)
   GtkTextPrivate *priv = gtk_text_get_instance_private (self);
   GtkWidget *chooser;
 
+  gtk_text_keep_primary_selection (self);
+
   priv->current_pos = priv->selection_bound = 0;
   gtk_text_reset_im_context (self);
   gtk_text_reset_layout (self);
@@ -2186,6 +2231,7 @@ gtk_text_finalize (GObject *object)
   GtkText *self = GTK_TEXT (object);
   GtkTextPrivate *priv = gtk_text_get_instance_private (self);
 
+  GTK_TEXT_CONTENT (priv->selection_content)->self = NULL;
   g_clear_object (&priv->selection_content);
 
   g_clear_object (&priv->history);
@@ -2403,8 +2449,15 @@ gtk_text_unrealize (GtkWidget *widget)
   gtk_text_reset_layout (self);
 
   clipboard = gtk_widget_get_primary_clipboard (widget);
-  if (gdk_clipboard_get_content (clipboard) == priv->selection_content)
-    gdk_clipboard_set_content (clipboard, NULL);
+  if (gtk_text_keep_primary_selection (self))
+    {
+      /* Deselect, as losing PRIMARY would have done */
+      gtk_text_set_selection_bounds (self, priv->current_pos, priv->current_pos);
+    }
+  else if (gdk_clipboard_get_content (clipboard) == priv->selection_content)
+    {
+      gdk_clipboard_set_content (clipboard, NULL);
+    }
 
   GTK_WIDGET_CLASS (gtk_text_parent_class)->unrealize (widget);
 }
@@ -3864,6 +3917,15 @@ buffer_deleted_text (GtkEntryBuffer *buffer,
   GtkTextPrivate *priv = gtk_text_get_instance_private (self);
   guint end_pos = position + n_chars;
 
+  /* If the whole selection gets deleted, buffer_deleted_text_after()
+   * will collapse it, and the text will be gone by then
+   */
+  if ((int) position <= MIN (priv->current_pos, priv->selection_bound) &&
+      (int) end_pos >= MAX (priv->current_pos, priv->selection_bound))
+    {
+      gtk_text_keep_primary_selection (self);
+    }
+
   if (gtk_text_history_get_enabled (priv->history))
     {
       char *deleted_text;
@@ -4627,6 +4689,12 @@ gtk_text_set_positions (GtkText *self,
 {
   GtkTextPrivate *priv = gtk_text_get_instance_private (self);
   gboolean changed = FALSE;
+
+  if ((current_pos != -1 ? current_pos : priv->current_pos) ==
+      (selection_bound != -1 ? selection_bound : priv->selection_bound))
+    {
+      gtk_text_keep_primary_selection (self);
+    }
 
   g_object_freeze_notify (G_OBJECT (self));
 
@@ -5614,6 +5682,67 @@ gtk_text_update_primary_selection (GtkText *self)
     }
 }
 
+/* Called right before the selection goes away, either because it
+ * collapses or because the selected text is deleted.
+ *
+ * Like browsers and other toolkits do, we keep the last selected text
+ * in PRIMARY instead of clearing it, until something else is selected.
+ * To do so, our provider is turned into a snapshot of the selected
+ * text, and a new provider is used for the next selection. This does
+ * not touch the clipboard itself, so we never claim it anew, and we
+ * do nothing if we lost it already.
+ *
+ * Returns: whether a snapshot was taken
+ */
+static gboolean
+gtk_text_keep_primary_selection (GtkText *self)
+{
+  GtkTextPrivate *priv = gtk_text_get_instance_private (self);
+  GtkTextContent *content;
+  GtkInputPurpose purpose;
+  GdkClipboard *clipboard;
+  char *text;
+
+  if (priv->selection_bound == priv->current_pos)
+    return FALSE;
+
+  if (!gtk_widget_get_realized (GTK_WIDGET (self)))
+    return FALSE;
+
+  clipboard = gtk_widget_get_primary_clipboard (GTK_WIDGET (self));
+  if (gdk_clipboard_get_content (clipboard) != priv->selection_content)
+    return FALSE;
+
+  /* Don't keep passwords around, not even revealed ones */
+  purpose = gtk_text_get_input_purpose (self);
+  if (!priv->visible || priv->ever_invisible ||
+      purpose == GTK_INPUT_PURPOSE_PASSWORD ||
+      purpose == GTK_INPUT_PURPOSE_PIN ||
+      GTK_IS_PASSWORD_ENTRY_BUFFER (get_buffer (self)))
+    {
+      return FALSE;
+    }
+
+  text = gtk_text_get_display_text (self,
+                                    MIN (priv->selection_bound, priv->current_pos),
+                                    MAX (priv->selection_bound, priv->current_pos));
+  if (text[0] == '\0')
+    {
+      g_free (text);
+      return FALSE;
+    }
+
+  content = GTK_TEXT_CONTENT (priv->selection_content);
+  content->text = text;
+  content->self = NULL;
+
+  /* The clipboard holds a reference on the snapshot */
+  g_object_unref (priv->selection_content);
+  priv->selection_content = gtk_text_content_new (self);
+
+  return TRUE;
+}
+
 /* Public API
  */
 
@@ -5707,6 +5836,19 @@ gtk_text_set_buffer (GtkText        *self,
 
   if (priv->buffer)
     {
+      /* The selection goes away with the buffer. If its text can't
+       * be kept, give up PRIMARY now, while the positions still refer
+       * to the buffer
+       */
+      if (!gtk_text_keep_primary_selection (self) &&
+          gtk_widget_get_realized (GTK_WIDGET (self)))
+        {
+          GdkClipboard *clipboard = gtk_widget_get_primary_clipboard (GTK_WIDGET (self));
+
+          if (gdk_clipboard_get_content (clipboard) == priv->selection_content)
+            gdk_clipboard_set_content (clipboard, NULL);
+        }
+
       had_buffer = TRUE;
       old_length = gtk_entry_buffer_get_length (priv->buffer);
       buffer_disconnect_signals (self);
@@ -5854,6 +5996,8 @@ gtk_text_set_visibility (GtkText  *self,
   if (priv->visible != visible)
     {
       priv->visible = visible;
+      if (!visible)
+        priv->ever_invisible = TRUE;
 
       g_object_notify_by_pspec (G_OBJECT (self), text_props[PROP_VISIBILITY]);
       gtk_text_update_cached_style_values (self);
