@@ -174,6 +174,10 @@ static void          free_log_attr_cache (GtkTextLogAttrCache *cache);
 
 static void remove_all_selection_clipboards       (GtkTextBuffer *buffer);
 static void update_selection_clipboards           (GtkTextBuffer *buffer);
+static gboolean selection_content_is_claimed      (GtkTextBuffer *buffer);
+static gboolean keep_selection_content            (GtkTextBuffer     *buffer,
+                                                   const GtkTextIter *start,
+                                                   const GtkTextIter *end);
 
 static void gtk_text_buffer_set_property (GObject         *object,
 				          guint            prop_id,
@@ -221,7 +225,11 @@ struct _GtkTextBufferContent
 {
   GdkContentProvider parent;
 
+  /* The buffer whose selection is served, or NULL once the
+   * provider has been turned into a snapshot of @text
+   */
   GtkTextBuffer *text_buffer;
+  char *text;
 };
 
 struct _GtkTextBufferContentClass
@@ -247,6 +255,8 @@ gtk_text_buffer_content_ref_formats (GdkContentProvider *provider)
 
   if (content->text_buffer)
     return gdk_content_formats_new_for_gtype (GTK_TYPE_TEXT_BUFFER);
+  else if (content->text)
+    return gdk_content_formats_new_for_gtype (G_TYPE_STRING);
   else
     return gdk_content_formats_new (NULL, 0);
 }
@@ -262,6 +272,12 @@ gtk_text_buffer_content_get_value (GdkContentProvider  *provider,
       content->text_buffer != NULL)
     {
       g_value_set_object (value, content->text_buffer);
+      return TRUE;
+    }
+  else if (G_VALUE_HOLDS (value, G_TYPE_STRING) &&
+           content->text != NULL)
+    {
+      g_value_set_string (value, content->text);
       return TRUE;
     }
 
@@ -292,9 +308,22 @@ gtk_text_buffer_content_detach (GdkContentProvider *provider,
 }
 
 static void
+gtk_text_buffer_content_finalize (GObject *object)
+{
+  GtkTextBufferContent *content = GTK_TEXT_BUFFER_CONTENT (object);
+
+  g_free (content->text);
+
+  G_OBJECT_CLASS (gtk_text_buffer_content_parent_class)->finalize (object);
+}
+
+static void
 gtk_text_buffer_content_class_init (GtkTextBufferContentClass *class)
 {
+  GObjectClass *object_class = G_OBJECT_CLASS (class);
   GdkContentProviderClass *provider_class = GDK_CONTENT_PROVIDER_CLASS (class);
+
+  object_class->finalize = gtk_text_buffer_content_finalize;
 
   provider_class->ref_formats = gtk_text_buffer_content_ref_formats;
   provider_class->get_value = gtk_text_buffer_content_get_value;
@@ -2015,6 +2044,21 @@ gtk_text_buffer_real_delete_range (GtkTextBuffer *buffer,
   g_return_if_fail (start != NULL);
   g_return_if_fail (end != NULL);
 
+  /* If the whole selection gets deleted, keep its text in the
+   * clipboards while it is still there
+   */
+  if (selection_content_is_claimed (buffer))
+    {
+      GtkTextIter sel_start, sel_end;
+
+      if (gtk_text_buffer_get_selection_bounds (buffer, &sel_start, &sel_end) &&
+          gtk_text_iter_compare (start, &sel_start) <= 0 &&
+          gtk_text_iter_compare (end, &sel_end) >= 0)
+        {
+          keep_selection_content (buffer, &sel_start, &sel_end);
+        }
+    }
+
   if (gtk_text_history_get_enabled (buffer->priv->history))
     {
       GtkTextIter sel_begin, sel_end;
@@ -2537,8 +2581,25 @@ gtk_text_buffer_set_mark (GtkTextBuffer     *buffer,
 {
   GtkTextIter location;
   GtkTextMark *mark;
+  GtkTextIter sel_start, sel_end;
+  gboolean had_selection = FALSE;
 
   g_return_val_if_fail (gtk_text_iter_get_buffer (iter) == buffer, NULL);
+
+  /* Remember the selection, in case this collapses it */
+  if (buffer->priv->selection_content != NULL)
+    {
+      mark = existing_mark;
+      if (mark == NULL && mark_name != NULL)
+        mark = gtk_text_buffer_get_mark (buffer, mark_name);
+
+      if ((mark == gtk_text_buffer_get_insert (buffer) ||
+           mark == gtk_text_buffer_get_selection_bound (buffer)) &&
+          selection_content_is_claimed (buffer))
+        {
+          had_selection = gtk_text_buffer_get_selection_bounds (buffer, &sel_start, &sel_end);
+        }
+    }
 
   mark = _gtk_text_btree_set_mark (get_btree (buffer),
                                    existing_mark,
@@ -2546,6 +2607,13 @@ gtk_text_buffer_set_mark (GtkTextBuffer     *buffer,
                                    left_gravity,
                                    iter,
                                    should_exist);
+
+  /* Moving marks does not invalidate iters */
+  if (had_selection &&
+      !gtk_text_buffer_get_selection_bounds (buffer, NULL, NULL))
+    {
+      keep_selection_content (buffer, &sel_start, &sel_end);
+    }
 
   _gtk_text_btree_get_iter_at_mark (get_btree (buffer),
                                    &location,
@@ -2920,13 +2988,27 @@ gtk_text_buffer_select_range (GtkTextBuffer     *buffer,
 {
   GtkTextIter real_ins;
   GtkTextIter real_bound;
+  GtkTextIter sel_start, sel_end;
+  gboolean had_selection = FALSE;
 
   g_return_if_fail (GTK_IS_TEXT_BUFFER (buffer));
 
   real_ins = *ins;
   real_bound = *bound;
 
+  /* Remember the selection, in case this collapses it */
+  if (selection_content_is_claimed (buffer))
+    had_selection = gtk_text_buffer_get_selection_bounds (buffer, &sel_start, &sel_end);
+
   _gtk_text_btree_select_range (get_btree (buffer), &real_ins, &real_bound);
+
+  /* Moving marks does not invalidate iters */
+  if (had_selection &&
+      !gtk_text_buffer_get_selection_bounds (buffer, NULL, NULL))
+    {
+      keep_selection_content (buffer, &sel_start, &sel_end);
+    }
+
   gtk_text_buffer_mark_set (buffer, &real_ins,
                             gtk_text_buffer_get_insert (buffer));
   gtk_text_buffer_mark_set (buffer, &real_bound,
@@ -3931,6 +4013,70 @@ update_selection_clipboards (GtkTextBuffer *buffer)
     }
 }
 
+/* Whether the provider for the current selection is set in
+ * at least one of the selection clipboards
+ */
+static gboolean
+selection_content_is_claimed (GtkTextBuffer *buffer)
+{
+  GtkTextBufferPrivate *priv = buffer->priv;
+  GSList *l;
+
+  if (priv->selection_content == NULL)
+    return FALSE;
+
+  for (l = priv->selection_clipboards; l; l = l->next)
+    {
+      SelectionClipboard *selection_clipboard = l->data;
+
+      if (gdk_clipboard_get_content (selection_clipboard->clipboard) == priv->selection_content)
+        return TRUE;
+    }
+
+  return FALSE;
+}
+
+/* Called when the selection between @start and @end goes away, either
+ * because it collapses or because it is deleted, while its text is
+ * still in the buffer.
+ *
+ * Like browsers and other toolkits do, we keep the last selected text
+ * in PRIMARY (and any other selection clipboard) instead of clearing
+ * it, until something else is selected. To do so, the provider is
+ * turned into a snapshot of the selected text, and a new one is created
+ * for the next selection. This does not touch the clipboards themselves,
+ * so we never claim them anew, and clipboards that we lost already are
+ * not affected.
+ *
+ * Returns: whether a snapshot was taken
+ */
+static gboolean
+keep_selection_content (GtkTextBuffer     *buffer,
+                        const GtkTextIter *start,
+                        const GtkTextIter *end)
+{
+  GtkTextBufferPrivate *priv = buffer->priv;
+  GtkTextBufferContent *content;
+  char *text;
+
+  /* This is what gtk_text_buffer_serialize_text_plain() would provide */
+  text = gtk_text_iter_get_visible_text (start, end);
+  if (text[0] == '\0')
+    {
+      g_free (text);
+      return FALSE;
+    }
+
+  content = GTK_TEXT_BUFFER_CONTENT (priv->selection_content);
+  content->text = text;
+  content->text_buffer = NULL;
+
+  /* The clipboards hold references on the snapshot */
+  g_clear_object (&priv->selection_content);
+
+  return TRUE;
+}
+
 static SelectionClipboard *
 find_selection_clipboard (GtkTextBuffer *buffer,
 			  GdkClipboard  *clipboard)
@@ -4013,7 +4159,26 @@ gtk_text_buffer_remove_selection_clipboard (GtkTextBuffer *buffer,
     {
       if (priv->selection_content &&
           gdk_clipboard_get_content (clipboard) == priv->selection_content)
-	gdk_clipboard_set_content (clipboard, NULL);
+        {
+          GtkTextIter start, end;
+
+          if (gtk_text_buffer_get_selection_bounds (buffer, &start, &end) &&
+              keep_selection_content (buffer, &start, &end))
+            {
+              GtkTextIter insert;
+
+              /* Deselect, as losing the clipboard would have done */
+              gtk_text_buffer_get_iter_at_mark (buffer, &insert,
+                                                gtk_text_buffer_get_insert (buffer));
+              gtk_text_buffer_move_mark (buffer,
+                                         gtk_text_buffer_get_selection_bound (buffer),
+                                         &insert);
+            }
+          else
+            {
+              gdk_clipboard_set_content (clipboard, NULL);
+            }
+        }
 
       buffer->priv->selection_clipboards = g_slist_remove (buffer->priv->selection_clipboards,
                                                            selection_clipboard);
