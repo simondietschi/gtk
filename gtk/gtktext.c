@@ -757,9 +757,9 @@ gtk_text_content_detach (GdkContentProvider *provider,
                           GdkClipboard       *clipboard)
 {
   GtkTextContent *content = GTK_TEXT_CONTENT (provider);
-  int current_pos, selection_bound;
+  int selection_bound, current_pos;
 
-  gtk_text_get_selection_bounds (content->self, &current_pos, &selection_bound);
+  gtk_text_get_selection_bounds (content->self, &selection_bound, &current_pos);
   gtk_text_set_selection_bounds (content->self, current_pos, current_pos);
 }
 
