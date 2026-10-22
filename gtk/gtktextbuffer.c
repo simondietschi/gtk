@@ -396,8 +396,8 @@ gtk_text_buffer_deserialize_text_plain (GdkContentDeserializer *deserializer)
   GError *error = NULL;
 
   buffer = gtk_text_buffer_new (NULL);
-  g_value_set_object (gdk_content_deserializer_get_value (deserializer),
-                      buffer);
+  g_value_take_object (gdk_content_deserializer_get_value (deserializer),
+                       buffer);
 
   /* validates the stream */
   converter = g_charset_converter_new ("utf-8",
@@ -3987,7 +3987,7 @@ update_selection_clipboards (GtkTextBuffer *buffer)
     {
       if (priv->selection_content)
         gdk_content_provider_content_changed (priv->selection_content);
-      else
+      else if (priv->selection_clipboards)
         priv->selection_content = gtk_text_buffer_content_new (buffer);
 
       for (l = priv->selection_clipboards; l; l = l->next)
