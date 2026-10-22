@@ -459,6 +459,7 @@ static void gtk_label_do_popup                   (GtkLabel      *self,
 static void gtk_label_ensure_select_info  (GtkLabel *self);
 static void gtk_label_clear_select_info   (GtkLabel *self);
 static void gtk_label_clear_provider_info (GtkLabel *self);
+static gboolean gtk_label_keep_primary_selection (GtkLabel *self);
 static void gtk_label_clear_layout        (GtkLabel *self);
 static void gtk_label_ensure_layout       (GtkLabel *self);
 static void gtk_label_select_region_index (GtkLabel *self,
@@ -1574,6 +1575,8 @@ gtk_label_dispose (GObject *object)
 {
   GtkLabel *self = GTK_LABEL (object);
 
+  gtk_label_keep_primary_selection (self);
+
   gtk_label_set_mnemonic_widget (self, NULL);
   gtk_label_clear_select_info (self);
   gtk_label_clear_provider_info (self);
@@ -1615,6 +1618,7 @@ gtk_label_finalize (GObject *object)
   g_clear_pointer (&self->attrs, pango_attr_list_unref);
   g_clear_pointer (&self->markup_attrs, pango_attr_list_unref);
 
+  gtk_label_clear_provider_info (self);
   if (self->select_info && self->select_info->provider)
     g_object_unref (self->select_info->provider);
 
@@ -1634,8 +1638,14 @@ gtk_label_unrealize (GtkWidget *widget)
 {
   GtkLabel *self = GTK_LABEL (widget);
 
-  if (self->select_info &&
-      self->select_info->provider)
+  if (gtk_label_keep_primary_selection (self))
+    {
+      /* Deselect, as losing PRIMARY would have done */
+      self->select_info->selection_anchor = self->select_info->selection_end;
+      gtk_widget_queue_draw (widget);
+    }
+  else if (self->select_info &&
+           self->select_info->provider)
     {
       GdkClipboard *clipboard = gtk_widget_get_primary_clipboard (widget);
 
@@ -3210,6 +3220,8 @@ gtk_label_set_text_internal (GtkLabel *self,
       g_free (str);
       return;
     }
+
+  gtk_label_keep_primary_selection (self);
 
   g_free (self->text);
   self->text = str;
@@ -4938,7 +4950,11 @@ struct _GtkLabelContent
 {
   GdkContentProvider parent;
 
+  /* The label whose selection is served, or NULL once the
+   * provider has been turned into a snapshot of @text
+   */
   GtkLabel *label;
+  char *text;
 };
 
 struct _GtkLabelContentClass
@@ -4955,7 +4971,7 @@ gtk_label_content_ref_formats (GdkContentProvider *provider)
 {
   GtkLabelContent *content = GTK_LABEL_CONTENT (provider);
 
-  if (content->label)
+  if (content->label || content->text)
     return gdk_content_formats_new_for_gtype (G_TYPE_STRING);
   else
     return gdk_content_formats_new (NULL, 0);
@@ -4969,7 +4985,13 @@ gtk_label_content_get_value (GdkContentProvider  *provider,
   GtkLabelContent *content = GTK_LABEL_CONTENT (provider);
 
   if (G_VALUE_HOLDS (value, G_TYPE_STRING) &&
-      content->label != NULL)
+      content->text != NULL)
+    {
+      g_value_set_string (value, content->text);
+      return TRUE;
+    }
+  else if (G_VALUE_HOLDS (value, G_TYPE_STRING) &&
+           content->label != NULL)
     {
       GtkLabel *self = content->label;
 
@@ -5020,9 +5042,22 @@ gtk_label_content_detach (GdkContentProvider *provider,
 }
 
 static void
+gtk_label_content_finalize (GObject *object)
+{
+  GtkLabelContent *content = GTK_LABEL_CONTENT (object);
+
+  g_free (content->text);
+
+  G_OBJECT_CLASS (gtk_label_content_parent_class)->finalize (object);
+}
+
+static void
 gtk_label_content_class_init (GtkLabelContentClass *class)
 {
+  GObjectClass *object_class = G_OBJECT_CLASS (class);
   GdkContentProviderClass *provider_class = GDK_CONTENT_PROVIDER_CLASS (class);
+
+  object_class->finalize = gtk_label_content_finalize;
 
   provider_class->ref_formats = gtk_label_content_ref_formats;
   provider_class->get_value = gtk_label_content_get_value;
@@ -5032,6 +5067,17 @@ gtk_label_content_class_init (GtkLabelContentClass *class)
 static void
 gtk_label_content_init (GtkLabelContent *content)
 {
+}
+
+static GdkContentProvider *
+gtk_label_content_new (GtkLabel *self)
+{
+  GtkLabelContent *content;
+
+  content = g_object_new (GTK_TYPE_LABEL_CONTENT, NULL);
+  content->label = self;
+
+  return GDK_CONTENT_PROVIDER (content);
 }
 
 static void
@@ -5081,8 +5127,7 @@ gtk_label_ensure_select_info (GtkLabel *self)
                         G_CALLBACK (focus_change), self);
       gtk_widget_add_controller (GTK_WIDGET (self), GTK_EVENT_CONTROLLER (self->select_info->focus_controller));
 
-      self->select_info->provider = g_object_new (GTK_TYPE_LABEL_CONTENT, NULL);
-      GTK_LABEL_CONTENT (self->select_info->provider)->label = self;
+      self->select_info->provider = gtk_label_content_new (self);
 
       gtk_label_update_cursor (self);
     }
@@ -5118,6 +5163,67 @@ gtk_label_clear_provider_info (GtkLabel *self)
     return;
 
   GTK_LABEL_CONTENT (self->select_info->provider)->label = NULL;
+}
+
+/* Called right before the selection goes away, either because it
+ * collapses or because the text changes.
+ *
+ * Like browsers and other toolkits do, we keep the last selected text
+ * in PRIMARY instead of clearing it, until something else is selected.
+ * To do so, our provider is turned into a snapshot of the selected
+ * text, and a new provider is used for the next selection. This does
+ * not touch the clipboard itself, so we never claim it anew, and we
+ * do nothing if we lost it already.
+ *
+ * Returns: whether a snapshot was taken
+ */
+static gboolean
+gtk_label_keep_primary_selection (GtkLabel *self)
+{
+  GtkLabelContent *content;
+  GdkDisplay *display;
+  GdkClipboard *clipboard;
+  GtkLabel *owner;
+  int start, end;
+  int len;
+
+  if (self->select_info == NULL ||
+      self->select_info->selection_anchor == self->select_info->selection_end)
+    {
+      return FALSE;
+    }
+
+  display = gtk_widget_get_display (GTK_WIDGET (self));
+  if (display == NULL)
+    return FALSE;
+
+  clipboard = gdk_display_get_primary_clipboard (display);
+  if (gdk_clipboard_get_content (clipboard) != self->select_info->provider)
+    return FALSE;
+
+  start = MIN (self->select_info->selection_anchor,
+               self->select_info->selection_end);
+  end = MAX (self->select_info->selection_anchor,
+             self->select_info->selection_end);
+
+  len = strlen (self->text);
+  end = MIN (end, len);
+  start = MIN (start, len);
+  if (start == end)
+    return FALSE;
+
+  content = GTK_LABEL_CONTENT (self->select_info->provider);
+  owner = content->label;
+  content->text = g_strndup (self->text + start, end - start);
+  content->label = NULL;
+
+  /* The clipboard holds a reference on the snapshot. The new provider
+   * stays detached from us if dispose made the old one do so
+   */
+  g_object_unref (self->select_info->provider);
+  self->select_info->provider = gtk_label_content_new (owner);
+
+  return TRUE;
 }
 
 /**
@@ -5258,6 +5364,9 @@ gtk_label_select_region_index (GtkLabel *self,
       if (self->select_info->selection_anchor == anchor_index &&
           self->select_info->selection_end == end_index)
         return;
+
+      if (anchor_index == end_index)
+        gtk_label_keep_primary_selection (self);
 
       g_object_freeze_notify (G_OBJECT (self));
 
