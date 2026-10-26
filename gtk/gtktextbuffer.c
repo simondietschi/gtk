@@ -3896,6 +3896,8 @@ paste_from_buffer (GdkClipboard      *clipboard,
 {
   GtkTextIter insert_point;
   GtkTextBuffer *buffer = request_data->buffer;
+  GtkTextBuffer *copy = NULL;
+  GtkTextIter copy_start, copy_end;
 
   /* We're about to emit a bunch of signals, so be safe */
   g_object_ref (src_buffer);
@@ -3920,17 +3922,37 @@ paste_from_buffer (GdkClipboard      *clipboard,
           (gtk_text_iter_can_insert (&insert_point,
                                      request_data->default_editable)))
         {
-          /* This unselects the text we may be pasting, but moving
-           * marks does not invalidate @start and @end
-           */
           if (request_data->place_cursor)
-            gtk_text_buffer_place_cursor (buffer, &insert_point);
+            {
+              /* When pasting our own selection, copy it before placing
+               * the cursor unselects it, and so that we don't insert
+               * a range into itself
+               */
+              if (src_buffer == buffer)
+                {
+                  copy = gtk_text_buffer_new (gtk_text_buffer_get_tag_table (buffer));
+                  gtk_text_buffer_set_enable_undo (copy, FALSE);
+                  gtk_text_buffer_get_start_iter (copy, &copy_start);
+                  gtk_text_buffer_insert_range (copy, &copy_start, start, end);
+                  gtk_text_buffer_get_bounds (copy, &copy_start, &copy_end);
+                  start = &copy_start;
+                  end = &copy_end;
+                }
+
+              gtk_text_buffer_place_cursor (buffer, &insert_point);
+
+              /* Handlers may have changed the text */
+              gtk_text_buffer_get_iter_at_mark (buffer, &insert_point,
+                                                gtk_text_buffer_get_insert (buffer));
+            }
 
           gtk_text_buffer_real_insert_range (buffer,
                                              &insert_point,
                                              start,
                                              end,
                                              request_data->interactive);
+
+          g_clear_object (&copy);
         }
     }
 
