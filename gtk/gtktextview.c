@@ -5760,6 +5760,8 @@ gtk_text_view_click_gesture_pressed (GtkGestureClick *gesture,
                              GTK_EVENT_SEQUENCE_CLAIMED);
       get_iter_from_gesture (text_view, GTK_GESTURE (gesture),
                              &iter, NULL, NULL);
+      /* The cursor moves to the pasted text */
+      priv->scroll_after_paste = gtk_text_iter_can_insert (&iter, priv->editable);
       gtk_text_buffer_paste_clipboard (get_buffer (text_view),
                                        gtk_widget_get_primary_clipboard (GTK_WIDGET (text_view)),
                                        &iter,
