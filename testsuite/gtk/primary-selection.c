@@ -307,6 +307,17 @@ paste_at (GtkTextBuffer *buffer,
 }
 
 static void
+assert_cursor_at (GtkTextBuffer *buffer,
+                  int            cursor)
+{
+  GtkTextIter iter;
+
+  g_assert_false (gtk_text_buffer_get_has_selection (buffer));
+  gtk_text_buffer_get_iter_at_mark (buffer, &iter, gtk_text_buffer_get_insert (buffer));
+  g_assert_cmpint (gtk_text_iter_get_offset (&iter), ==, cursor);
+}
+
+static void
 assert_buffer (GtkTextBuffer *buffer,
                const char    *expected,
                int            cursor)
@@ -319,9 +330,7 @@ assert_buffer (GtkTextBuffer *buffer,
   g_assert_cmpstr (text, ==, expected);
   g_free (text);
 
-  g_assert_false (gtk_text_buffer_get_has_selection (buffer));
-  gtk_text_buffer_get_iter_at_mark (buffer, &start, gtk_text_buffer_get_insert (buffer));
-  g_assert_cmpint (gtk_text_iter_get_offset (&start), ==, cursor);
+  assert_cursor_at (buffer, cursor);
 }
 
 /* Middle-click pasting inserts at the click position and moves the
@@ -332,7 +341,9 @@ test_text_buffer_paste_at (void)
 {
   GtkTextBuffer *buffer;
   GtkTextIter iter, start, end;
+  GdkPaintable *paintable;
   GtkTextTag *tag;
+  char *text;
 
   if (skip_without_focus ())
     return;
@@ -362,6 +373,20 @@ test_text_buffer_paste_at (void)
   select_range (buffer, 11, 6);
   paste_at (buffer, 8, TRUE);
   assert_buffer (buffer, "Hello woworldrld", 13);
+
+  /* Right before an image inside the selection */
+  gtk_text_buffer_set_text (buffer, "ab", -1);
+  gtk_text_buffer_get_iter_at_offset (buffer, &iter, 1);
+  paintable = gdk_paintable_new_empty (1, 1);
+  gtk_text_buffer_insert_paintable (buffer, &iter, paintable);
+  g_object_unref (paintable);
+  select_range (buffer, 3, 0);
+  paste_at (buffer, 1, TRUE);
+  gtk_text_buffer_get_bounds (buffer, &start, &end);
+  text = gtk_text_buffer_get_slice (buffer, &start, &end, TRUE);
+  g_assert_cmpstr (text, ==, "aa" "\xef\xbf\xbc" "b" "\xef\xbf\xbc" "b");
+  g_free (text);
+  assert_cursor_at (buffer, 4);
 
   /* Not editable */
   gtk_text_buffer_set_text (buffer, "Hello world", -1);
