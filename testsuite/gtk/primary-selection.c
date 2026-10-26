@@ -287,6 +287,95 @@ test_text_buffer_paste (void)
 }
 
 static void
+paste_at (GtkTextBuffer *buffer,
+          int            offset,
+          gboolean       default_editable)
+{
+  GtkTextIter iter;
+  gboolean done = FALSE;
+  gulong handler;
+  guint id;
+
+  gtk_text_buffer_get_iter_at_offset (buffer, &iter, offset);
+  handler = g_signal_connect (buffer, "paste-done", G_CALLBACK (paste_done), &done);
+  id = g_timeout_add_seconds (5, timed_out, (gpointer) "the paste");
+  gtk_text_buffer_paste_clipboard (buffer, get_primary (), &iter, default_editable);
+  while (!done)
+    g_main_context_iteration (NULL, TRUE);
+  g_source_remove (id);
+  g_signal_handler_disconnect (buffer, handler);
+}
+
+static void
+assert_buffer (GtkTextBuffer *buffer,
+               const char    *expected,
+               int            cursor)
+{
+  GtkTextIter start, end;
+  char *text;
+
+  gtk_text_buffer_get_bounds (buffer, &start, &end);
+  text = gtk_text_buffer_get_text (buffer, &start, &end, FALSE);
+  g_assert_cmpstr (text, ==, expected);
+  g_free (text);
+
+  g_assert_false (gtk_text_buffer_get_has_selection (buffer));
+  gtk_text_buffer_get_iter_at_mark (buffer, &start, gtk_text_buffer_get_insert (buffer));
+  g_assert_cmpint (gtk_text_iter_get_offset (&start), ==, cursor);
+}
+
+/* Middle-click pasting inserts at the click position and moves the
+ * cursor there, also when clicking right after or into the selection
+ */
+static void
+test_text_buffer_paste_at (void)
+{
+  GtkTextBuffer *buffer;
+  GtkTextIter iter, start, end;
+  GtkTextTag *tag;
+
+  if (skip_without_focus ())
+    return;
+
+  set_primary ("other");
+  buffer = create_buffer ("Hello world");
+  tag = gtk_text_buffer_create_tag (buffer, NULL, NULL);
+
+  gtk_text_buffer_get_iter_at_offset (buffer, &start, 6);
+  gtk_text_buffer_get_iter_at_offset (buffer, &end, 11);
+  gtk_text_buffer_apply_tag (buffer, tag, &start, &end);
+  select_range (buffer, 11, 6);
+  paste_at (buffer, 11, TRUE);
+  assert_buffer (buffer, "Hello worldworld", 16);
+  assert_primary ("world");
+
+  /* Tags come along */
+  gtk_text_buffer_get_iter_at_offset (buffer, &iter, 11);
+  g_assert_true (gtk_text_iter_has_tag (&iter, tag));
+
+  /* Pasting the kept text again */
+  paste_at (buffer, 16, TRUE);
+  assert_buffer (buffer, "Hello worldworldworld", 21);
+
+  /* Into the selection */
+  gtk_text_buffer_set_text (buffer, "Hello world", -1);
+  select_range (buffer, 11, 6);
+  paste_at (buffer, 8, TRUE);
+  assert_buffer (buffer, "Hello woworldrld", 13);
+
+  /* Not editable */
+  gtk_text_buffer_set_text (buffer, "Hello world", -1);
+  select_range (buffer, 11, 6);
+  paste_at (buffer, 11, FALSE);
+  g_assert_true (gtk_text_buffer_get_has_selection (buffer));
+  gtk_text_buffer_get_iter_at_mark (buffer, &iter, gtk_text_buffer_get_insert (buffer));
+  g_assert_cmpint (gtk_text_iter_get_offset (&iter), ==, 11);
+
+  gtk_text_buffer_remove_selection_clipboard (buffer, get_primary ());
+  g_object_unref (buffer);
+}
+
+static void
 test_label (void)
 {
   GtkWidget *label;
@@ -589,6 +678,7 @@ main (int   argc,
   g_test_add_func ("/primary-selection/text-buffer/no-steal", test_text_buffer_no_steal);
   g_test_add_func ("/primary-selection/text-buffer/remove-clipboard", test_text_buffer_remove_clipboard);
   g_test_add_func ("/primary-selection/text-buffer/paste", test_text_buffer_paste);
+  g_test_add_func ("/primary-selection/text-buffer/paste-at", test_text_buffer_paste_at);
   g_test_add_func ("/primary-selection/label", test_label);
   g_test_add_func ("/primary-selection/label/dispose", test_label_dispose);
   g_test_add_func ("/primary-selection/text", test_text);
