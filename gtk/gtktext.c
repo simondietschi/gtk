@@ -5616,6 +5616,8 @@ paste_received (GObject      *clipboard,
   if (text == NULL)
     {
       gtk_widget_error_bell (GTK_WIDGET (self));
+      priv->insert_pos = -1;
+      g_object_unref (self);
       return;
     }
 
