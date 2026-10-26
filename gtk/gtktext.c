@@ -5609,7 +5609,7 @@ paste_received (GObject      *clipboard,
   GtkText *self = GTK_TEXT (data);
   GtkTextPrivate *priv = gtk_text_get_instance_private (self);
   char *text;
-  int pos, start, end;
+  int pos;
   int length = -1;
 
   text = gdk_clipboard_read_text_finish (GDK_CLIPBOARD (clipboard), result, NULL);
@@ -5621,13 +5621,13 @@ paste_received (GObject      *clipboard,
       return;
     }
 
+  /* Like other toolkits, paste at the position of a middle click,
+   * also when clicking into the selection, instead of replacing it.
+   * This lets you paste the selection next to itself.
+   */
   if (priv->insert_pos >= 0)
     {
-      pos = priv->insert_pos;
-      start = priv->selection_bound;
-      end = priv->current_pos;
-      if (!((start <= pos && pos <= end) || (end <= pos && pos <= start)))
-        gtk_text_set_selection_bounds (self, pos, pos);
+      gtk_text_set_selection_bounds (self, priv->insert_pos, priv->insert_pos);
       priv->insert_pos = -1;
     }
 
