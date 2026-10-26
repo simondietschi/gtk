@@ -89,6 +89,7 @@ struct _ClipboardRequest
   guint interactive : 1;
   guint default_editable : 1;
   guint replace_selection : 1;
+  guint place_cursor : 1;
 };
 
 typedef struct _CommitFunc
@@ -3918,11 +3919,19 @@ paste_from_buffer (GdkClipboard      *clipboard,
       if (!request_data->interactive ||
           (gtk_text_iter_can_insert (&insert_point,
                                      request_data->default_editable)))
-        gtk_text_buffer_real_insert_range (buffer,
-                                           &insert_point,
-                                           start,
-                                           end,
-                                           request_data->interactive);
+        {
+          /* This unselects the text we may be pasting, but moving
+           * marks does not invalidate @start and @end
+           */
+          if (request_data->place_cursor)
+            gtk_text_buffer_place_cursor (buffer, &insert_point);
+
+          gtk_text_buffer_real_insert_range (buffer,
+                                             &insert_point,
+                                             start,
+                                             end,
+                                             request_data->interactive);
+        }
     }
 
   if (request_data->interactive)
@@ -4213,7 +4222,9 @@ remove_all_selection_clipboards (GtkTextBuffer *buffer)
  *
  * If @override_location is %NULL, the pasted text will be inserted
  * at the cursor position, or the buffer selection will be replaced
- * if the selection is non-empty.
+ * if the selection is non-empty. Otherwise, the pasted text will be
+ * inserted at @override_location, and the cursor will be moved there,
+ * unselecting any selected text.
  *
  * Note: pasting is asynchronous, that is, we’ll ask for the paste data
  * and return, and at some point later after the main loop runs, the paste
@@ -4238,19 +4249,24 @@ gtk_text_buffer_paste_clipboard (GtkTextBuffer *buffer,
   data->interactive = TRUE;
   data->default_editable = !!default_editable;
 
-  /* When pasting with the cursor inside the selection area, you
-   * replace the selection with the new text, otherwise, you
-   * simply insert the new text at the point where the click
-   * occurred, unselecting any selected text. The replace_selection
-   * flag toggles this behavior.
+  /* When pasting at the cursor, you replace the selection with the
+   * new text. When pasting at a given location, like middle-click
+   * pasting does, you insert the new text at the point where the
+   * click occurred and move the cursor there, unselecting any selected
+   * text, even when clicking into the selection. That's what other
+   * toolkits do, and it lets you paste the selection next to itself.
    */
   data->replace_selection = FALSE;
+  data->place_cursor = override_location != NULL;
 
-  get_paste_point (buffer, &paste_point, FALSE);
-  if (gtk_text_buffer_get_selection_bounds (buffer, &start, &end) &&
-      (gtk_text_iter_in_range (&paste_point, &start, &end) ||
-       gtk_text_iter_equal (&paste_point, &end)))
-    data->replace_selection = TRUE;
+  if (override_location == NULL)
+    {
+      get_paste_point (buffer, &paste_point, FALSE);
+      if (gtk_text_buffer_get_selection_bounds (buffer, &start, &end) &&
+          (gtk_text_iter_in_range (&paste_point, &start, &end) ||
+           gtk_text_iter_equal (&paste_point, &end)))
+        data->replace_selection = TRUE;
+    }
 
   gdk_clipboard_read_value_async (clipboard,
                                   GTK_TYPE_TEXT_BUFFER,
