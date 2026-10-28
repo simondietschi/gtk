@@ -50,13 +50,14 @@ text_received (GObject      *source,
 
 /* Returns "(none)" if there is nothing to paste */
 static char *
-read_primary (void)
+read_clipboard (GdkClipboard *clipboard,
+                const char   *name)
 {
   char *text = NULL;
   guint id;
 
-  id = g_timeout_add_seconds (5, timed_out, (gpointer) "PRIMARY");
-  gdk_clipboard_read_text_async (get_primary (), NULL, text_received, &text);
+  id = g_timeout_add_seconds (5, timed_out, (gpointer) name);
+  gdk_clipboard_read_text_async (clipboard, NULL, text_received, &text);
 
   while (text == NULL)
     g_main_context_iteration (NULL, TRUE);
@@ -64,6 +65,12 @@ read_primary (void)
   g_source_remove (id);
 
   return text;
+}
+
+static char *
+read_primary (void)
+{
+  return read_clipboard (get_primary (), "PRIMARY");
 }
 
 #define assert_primary(expected) \
@@ -77,6 +84,15 @@ static void
 set_primary (const char *text)
 {
   gdk_clipboard_set_text (get_primary (), text);
+}
+
+/* Drops what must be the last reference on @object */
+static void
+unref_and_assert_finalized (gpointer object)
+{
+  g_object_add_weak_pointer (object, &object);
+  g_object_unref (object);
+  g_assert_null (object);
 }
 
 static void
@@ -145,7 +161,7 @@ test_text_buffer_deselect (void)
   assert_primary ("primary selection");
 
   gtk_text_buffer_remove_selection_clipboard (buffer, get_primary ());
-  g_object_unref (buffer);
+  unref_and_assert_finalized (buffer);
 }
 
 static void
@@ -180,7 +196,7 @@ test_text_buffer_delete (void)
   assert_primary ("ij");
 
   gtk_text_buffer_remove_selection_clipboard (buffer, get_primary ());
-  g_object_unref (buffer);
+  unref_and_assert_finalized (buffer);
 }
 
 static void
@@ -215,7 +231,7 @@ test_text_buffer_no_steal (void)
   assert_primary ("Hello");
 
   gtk_text_buffer_remove_selection_clipboard (buffer, get_primary ());
-  g_object_unref (buffer);
+  unref_and_assert_finalized (buffer);
 }
 
 static void
@@ -237,8 +253,57 @@ test_text_buffer_remove_clipboard (void)
   g_assert_false (gtk_text_buffer_get_has_selection (buffer));
   assert_primary ("world");
 
-  g_object_unref (buffer);
+  unref_and_assert_finalized (buffer);
   assert_primary ("world");
+}
+
+static void
+test_text_buffer_finalize_drag (void)
+{
+  GtkTextBuffer *buffer;
+  GdkContentProvider *content;
+
+  /* The content for dragging the selection */
+  buffer = gtk_text_buffer_new (NULL);
+  gtk_text_buffer_set_text (buffer, "Hello world", -1);
+  select_range (buffer, 11, 6);
+  content = gtk_text_buffer_get_selection_content (buffer);
+  g_object_unref (content);
+
+  unref_and_assert_finalized (buffer);
+}
+
+static void
+test_text_buffer_finalize_lost (void)
+{
+  GdkClipboard *clipboard = gdk_display_get_clipboard (gdk_display_get_default ());
+  GtkTextBuffer *buffer;
+  char *text;
+
+  if (skip_without_focus ())
+    return;
+
+  set_primary ("other");
+  buffer = create_buffer ("Hello world");
+  gtk_text_buffer_add_selection_clipboard (buffer, clipboard);
+  select_range (buffer, 11, 6);
+
+  /* The selection keeps the buffer alive while it is served */
+  g_object_add_weak_pointer (G_OBJECT (buffer), (gpointer *) &buffer);
+  g_object_unref (buffer);
+  g_assert_nonnull (buffer);
+
+  /* Losing PRIMARY deselects, so the other clipboard keeps the text,
+   * and the buffer goes away while it is deselected
+   */
+  set_primary ("other");
+  g_assert_null (buffer);
+  assert_primary ("other");
+  text = read_clipboard (clipboard, "CLIPBOARD");
+  g_assert_cmpstr (text, ==, "world");
+  g_free (text);
+
+  gdk_clipboard_set_content (clipboard, NULL);
 }
 
 static void
@@ -281,9 +346,9 @@ test_text_buffer_paste (void)
   g_assert_cmpstr (text, ==, "Hello");
   g_free (text);
 
-  g_object_unref (other);
+  unref_and_assert_finalized (other);
   gtk_text_buffer_remove_selection_clipboard (buffer, get_primary ());
-  g_object_unref (buffer);
+  unref_and_assert_finalized (buffer);
 }
 
 static void
@@ -397,7 +462,7 @@ test_text_buffer_paste_at (void)
   g_assert_cmpint (gtk_text_iter_get_offset (&iter), ==, 11);
 
   gtk_text_buffer_remove_selection_clipboard (buffer, get_primary ());
-  g_object_unref (buffer);
+  unref_and_assert_finalized (buffer);
 }
 
 static void
@@ -702,6 +767,8 @@ main (int   argc,
   g_test_add_func ("/primary-selection/text-buffer/delete", test_text_buffer_delete);
   g_test_add_func ("/primary-selection/text-buffer/no-steal", test_text_buffer_no_steal);
   g_test_add_func ("/primary-selection/text-buffer/remove-clipboard", test_text_buffer_remove_clipboard);
+  g_test_add_func ("/primary-selection/text-buffer/finalize-drag", test_text_buffer_finalize_drag);
+  g_test_add_func ("/primary-selection/text-buffer/finalize-lost", test_text_buffer_finalize_lost);
   g_test_add_func ("/primary-selection/text-buffer/paste", test_text_buffer_paste);
   g_test_add_func ("/primary-selection/text-buffer/paste-at", test_text_buffer_paste_at);
   g_test_add_func ("/primary-selection/label", test_label);
