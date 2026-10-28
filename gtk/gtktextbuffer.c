@@ -290,22 +290,30 @@ gtk_text_buffer_content_detach (GdkContentProvider *provider,
                                 GdkClipboard       *clipboard)
 {
   GtkTextBufferContent *content = GTK_TEXT_BUFFER_CONTENT (provider);
+  GtkTextBuffer *buffer;
   GtkTextIter insert;
   GtkTextIter selection_bound;
 
   if (content->text_buffer == NULL)
     return;
 
+  /* Deselecting the buffer drops our reference on it, which may be
+   * the last one while the buffer is still busy deselecting
+   */
+  buffer = g_object_ref (content->text_buffer);
+
   /* Move selection_bound to the insertion point */
-  gtk_text_buffer_get_iter_at_mark (content->text_buffer, &insert,
-                                    gtk_text_buffer_get_insert (content->text_buffer));
-  gtk_text_buffer_get_iter_at_mark (content->text_buffer, &selection_bound,
-                                    gtk_text_buffer_get_selection_bound (content->text_buffer));
+  gtk_text_buffer_get_iter_at_mark (buffer, &insert,
+                                    gtk_text_buffer_get_insert (buffer));
+  gtk_text_buffer_get_iter_at_mark (buffer, &selection_bound,
+                                    gtk_text_buffer_get_selection_bound (buffer));
 
   if (!gtk_text_iter_equal (&insert, &selection_bound))
-    gtk_text_buffer_move_mark (content->text_buffer,
-                               gtk_text_buffer_get_selection_bound (content->text_buffer),
+    gtk_text_buffer_move_mark (buffer,
+                               gtk_text_buffer_get_selection_bound (buffer),
                                &insert);
+
+  g_object_unref (buffer);
 }
 
 static void
@@ -313,6 +321,7 @@ gtk_text_buffer_content_finalize (GObject *object)
 {
   GtkTextBufferContent *content = GTK_TEXT_BUFFER_CONTENT (object);
 
+  g_clear_object (&content->text_buffer);
   g_free (content->text);
 
   G_OBJECT_CLASS (gtk_text_buffer_content_parent_class)->finalize (object);
@@ -4031,7 +4040,7 @@ update_selection_clipboards (GtkTextBuffer *buffer)
     {
       if (priv->selection_content)
         {
-          GTK_TEXT_BUFFER_CONTENT (priv->selection_content)->text_buffer = NULL;
+          g_clear_object (&GTK_TEXT_BUFFER_CONTENT (priv->selection_content)->text_buffer);
           for (l = priv->selection_clipboards; l; l = l->next)
             {
               SelectionClipboard *selection_clipboard = l->data;
@@ -4100,7 +4109,7 @@ keep_selection_content (GtkTextBuffer     *buffer,
 
   content = GTK_TEXT_BUFFER_CONTENT (priv->selection_content);
   content->text = text;
-  content->text_buffer = NULL;
+  g_clear_object (&content->text_buffer);
 
   /* The clipboards hold references on the snapshot */
   g_clear_object (&priv->selection_content);
