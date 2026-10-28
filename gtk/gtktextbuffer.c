@@ -226,8 +226,9 @@ struct _GtkTextBufferContent
 {
   GdkContentProvider parent;
 
-  /* The buffer whose selection is served, or NULL once the
-   * provider has been turned into a snapshot of @text
+  /* A reference on the buffer whose selection is served, or NULL
+   * once the selection is gone. If its text was kept, @text holds
+   * a snapshot of it.
    */
   GtkTextBuffer *text_buffer;
   char *text;
@@ -297,8 +298,8 @@ gtk_text_buffer_content_detach (GdkContentProvider *provider,
   if (content->text_buffer == NULL)
     return;
 
-  /* Deselecting the buffer drops our reference on it, which may be
-   * the last one while the buffer is still busy deselecting
+  /* Deselecting the buffer can drop our reference on it, and that
+   * may be the last one while the buffer is still busy deselecting
    */
   buffer = g_object_ref (content->text_buffer);
 
