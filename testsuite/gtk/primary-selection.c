@@ -86,7 +86,11 @@ set_primary (const char *text)
   gdk_clipboard_set_text (get_primary (), text);
 }
 
-/* Drops what must be the last reference on @object */
+/* Drops what must be the last reference on @object
+ *
+ * Unlike g_assert_finalize_object(), this also checks it in builds
+ * with G_DISABLE_ASSERT.
+ */
 static void
 unref_and_assert_finalized (gpointer object)
 {
@@ -285,7 +289,6 @@ test_text_buffer_finalize_lost (void)
 
   set_primary ("other");
   buffer = create_buffer ("Hello world");
-  gtk_text_buffer_add_selection_clipboard (buffer, clipboard);
   select_range (buffer, 11, 6);
 
   /* The selection keeps the buffer alive while it is served */
@@ -293,9 +296,21 @@ test_text_buffer_finalize_lost (void)
   g_object_unref (buffer);
   g_assert_nonnull (buffer);
 
-  /* Losing PRIMARY deselects, so the other clipboard keeps the text,
-   * and the buffer goes away while it is deselected
+  /* Until losing PRIMARY deselects it */
+  set_primary ("other");
+  g_assert_null (buffer);
+  assert_primary ("other");
+
+  /* With a second clipboard, that one keeps the text, and the buffer
+   * goes away once it is deselected
    */
+  buffer = create_buffer ("Hello world");
+  gtk_text_buffer_add_selection_clipboard (buffer, clipboard);
+  select_range (buffer, 11, 6);
+  g_object_add_weak_pointer (G_OBJECT (buffer), (gpointer *) &buffer);
+  g_object_unref (buffer);
+  g_assert_nonnull (buffer);
+
   set_primary ("other");
   g_assert_null (buffer);
   assert_primary ("other");
